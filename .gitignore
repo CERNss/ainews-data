@@ -1,0 +1,41 @@
+# Go binary output
+/bin/
+/obj/
+
+# Go test binary
+*.test
+
+# Go workspace file
+go.work
+
+# Dependency directories
+/vendor/
+
+# IDE/editor specific files
+.vscode/
+.idea/
+*.swp
+*~
+*.sublime-workspace
+*.sublime-project
+
+# Go-related IDE/editor directories and files
+# (for example, Goland, VS Code, etc.)
+/*.vscode
+/.idea
+
+# Logs
+*.log
+
+# Compiled object files
+*.a
+*.o
+
+# Build directories
+/build/
+/dist/
+
+# Environment variables
+.env
+
+config/1-config.yaml

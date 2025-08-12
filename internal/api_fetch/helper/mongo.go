@@ -47,6 +47,8 @@ func ensureIndexes(ctx context.Context, s *Stores) {
 		{Keys: bson.D{{Key: "enabled", Value: 1}}},
 		{Keys: bson.D{{Key: "source", Value: 1}}},
 		{Keys: bson.D{{Key: "category", Value: 1}}},
+		{Keys: bson.D{{Key: "info_type", Value: 1}}},
+		{Keys: bson.D{{Key: "processed", Value: 1}}},
 	})
 }
 
@@ -67,19 +69,19 @@ func ConfigureTimeLocation(name string) error {
 	return nil
 }
 
-// ContentCollName 当天（或指定时间）对应的 collection 名称：content_YYYY_MM_DD
-func ContentCollName(t time.Time) string {
+// RawDataCollName 当天（或指定时间）对应的 collection 名称：rawdata_YYYY_MM_DD
+func RawDataCollName(t time.Time) string {
 	loc := shanghai
 	if loc == nil {
 		// 防御：若忘记初始化，仍使用 UTC+8 兜底
 		loc = time.FixedZone("CST", 8*3600)
 	}
 	day := t.In(loc).Format("2006_01_02")
-	return fmt.Sprintf("content_%s", day)
+	return fmt.Sprintf("rawdata_%s", day)
 }
 
-// EnsureContentIndexes 确保当天分表有索引（source、category、createdAt）
-func EnsureContentIndexes(ctx context.Context, db *mongo.Database, collName string) {
+// EnsureRawDataIndexes 确保当天分表有索引（source、category、createdAt）
+func EnsureRawDataIndexes(ctx context.Context, db *mongo.Database, collName string) {
 	c := db.Collection(collName)
 	_, _ = c.Indexes().CreateMany(ctx, []mongo.IndexModel{
 		{Keys: bson.D{{Key: "source", Value: 1}}},

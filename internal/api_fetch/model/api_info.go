@@ -9,5 +9,6 @@ type APIInfo struct {
 	Params   map[string]string `bson:"params,omitempty" json:"params,omitempty"` // ✅ 新增请求参数
 	Source   string            `bson:"source" json:"source"`                     // 来源
 	Category string            `bson:"category" json:"category"`                 // 信息分类
+	InfoType string            `bson:"info_type" json:"info_type"`               // ✅ 信息类型
 	Enabled  bool              `bson:"enabled" json:"enabled"`
 }

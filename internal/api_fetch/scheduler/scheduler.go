@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"go.uber.org/zap"
 	"io"
 	"net/http"
 	"net/url"
@@ -17,6 +18,7 @@ import (
 )
 
 type Worker struct {
+	Log        *zap.Logger
 	Stores     *helper.Stores
 	HTTPClient *http.Client
 }
@@ -78,13 +80,15 @@ func (w *Worker) runOnce(ctx context.Context) {
 	}(cur, ctx)
 
 	// 2) 确保当天分表 & 写入
-	collName := helper.ContentCollName(now)
-	helper.EnsureContentIndexes(ctx, w.Stores.DB, collName)
+	collName := helper.RawDataCollName(now)
+	helper.EnsureRawDataIndexes(ctx, w.Stores.DB, collName)
 	contentColl := w.Stores.DB.Collection(collName)
 
 	for cur.Next(ctx) {
 		var api model.APIInfo
+		w.Log.Info("Processing API", zap.String("api", cur.Current.String()))
 		if err := cur.Decode(&api); err != nil {
+			w.Log.Error("Failed to decode API", zap.Error(err))
 			continue
 		}
 		w.fetchAndSave(ctx, &api, contentColl, now)
@@ -130,6 +134,7 @@ func (w *Worker) fetchAndSave(ctx context.Context, api *model.APIInfo, contentCo
 
 	resp, err := w.HTTPClient.Do(req)
 	if err != nil {
+		w.Log.Error("Failed to fetch API", zap.String("url", api.URL), zap.Error(err))
 		return
 	}
 	defer func(Body io.ReadCloser) {
@@ -139,6 +144,8 @@ func (w *Worker) fetchAndSave(ctx context.Context, api *model.APIInfo, contentCo
 		}
 	}(resp.Body)
 	body, _ := io.ReadAll(resp.Body)
+
+	w.Log.Info("Fetched API", zap.String("body: ", string(body)))
 
 	var parsed any
 	if json.Unmarshal(body, &parsed) != nil {
@@ -160,7 +167,9 @@ func (w *Worker) fetchAndSave(ctx context.Context, api *model.APIInfo, contentCo
 		Date:      now.In(shanghai).Format("2006-01-02"),
 		Source:    api.Source,
 		Category:  api.Category,
+		InfoType:  api.InfoType,
 		Data:      data,
+		Processed: false, // 新增的默认值
 		CreatedAt: time.Now().UTC(),
 	}
 	_, _ = contentColl.InsertOne(ctx, doc)

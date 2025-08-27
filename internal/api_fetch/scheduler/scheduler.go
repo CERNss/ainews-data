@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"go.uber.org/zap"
 	"io"
 	"net/http"
@@ -148,17 +149,40 @@ func (w *Worker) fetchAndSave(ctx context.Context, api *model.APIInfo, contentCo
 	w.Log.Info("Fetched API", zap.String("body: ", string(body)))
 
 	var parsed any
-	if json.Unmarshal(body, &parsed) != nil {
-		parsed = bson.M{"raw": string(body)}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		w.Log.Warn("Invalid JSON, skip", zap.Error(err))
+		return
 	}
 
-	var data bson.M
-	switch v := parsed.(type) {
-	case map[string]any: // 正常 JSON 对象
-		data = v
-	default: // 数组/标量等，包一层 raw 保存
-		data = bson.M{"raw": v}
+	// 顶层必须是对象
+	parsedObj, ok := parsed.(map[string]any)
+	if !ok {
+		w.Log.Warn("Top-level is not JSON object, skip")
+		return
 	}
+
+	// Required 校验（全转 string 比较）
+	for key, want := range api.Required {
+		gotVal, exists := parsedObj[key]
+		if !exists {
+			w.Log.Warn("skip: missing required field", zap.String("field", key))
+			return
+		}
+		// 转成 string
+		wantStr := fmt.Sprint(want)
+		gotStr := fmt.Sprint(gotVal)
+		if gotStr != wantStr {
+			w.Log.Warn("skip: field value mismatch",
+				zap.String("field", key),
+				zap.String("want", wantStr),
+				zap.String("got", gotStr),
+			)
+			return
+		}
+	}
+
+	// 拆 data，只保留顶层对象
+	data := bson.M(parsedObj)
 
 	// 使用 Asia/Shanghai 生成 date 字段（YYYY-MM-DD）
 	shanghai, _ := time.LoadLocation("Asia/Shanghai")

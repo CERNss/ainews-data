@@ -92,11 +92,70 @@ func (w *Worker) runOnce(ctx context.Context) {
 			w.Log.Error("Failed to decode API", zap.Error(err))
 			continue
 		}
-		w.fetchAndSave(ctx, &api, contentColl, now)
+		w.fetchAndSaveWithRetry(ctx, &api, contentColl, now)
 	}
 }
 
-func (w *Worker) fetchAndSave(ctx context.Context, api *model.APIInfo, contentColl *mongo.Collection, now time.Time) {
+// calculateRetryDelay 计算重试延迟时间：15s * 2^(n-1)
+func (w *Worker) calculateRetryDelay(retryCount int) time.Duration {
+	if retryCount <= 0 {
+		return 15 * time.Second
+	}
+	// 15s * 2^(n-1)
+	delay := 15 * time.Second
+	for i := 1; i < retryCount; i++ {
+		delay *= 2
+	}
+	return delay
+}
+
+// fetchAndSaveWithRetry 带重试机制的抓取和保存
+func (w *Worker) fetchAndSaveWithRetry(ctx context.Context, api *model.APIInfo, contentColl *mongo.Collection, now time.Time) {
+	const maxRetries = 5
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		success := w.fetchAndSave(ctx, api, contentColl, now, attempt)
+		if success {
+			// 成功，退出重试循环
+			return
+		}
+
+		if attempt < maxRetries {
+			// 计算重试延迟：15s * 2^(n-1)
+			retryDelay := w.calculateRetryDelay(attempt)
+			w.Log.Info("Retrying after delay",
+				zap.String("source", api.Source),
+				zap.String("category", api.Category),
+				zap.Int("attempt", attempt),
+				zap.Int("maxRetries", maxRetries),
+				zap.Duration("delay", retryDelay),
+			)
+
+			// 等待重试延迟
+			timer := time.NewTimer(retryDelay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				w.Log.Info("Context cancelled, stopping retries",
+					zap.String("source", api.Source),
+					zap.String("category", api.Category),
+				)
+				return
+			case <-timer.C:
+				// 继续重试
+			}
+		} else {
+			// 达到最大重试次数
+			w.Log.Error("Max retries exceeded, giving up",
+				zap.String("source", api.Source),
+				zap.String("category", api.Category),
+				zap.Int("maxRetries", maxRetries),
+			)
+		}
+	}
+}
+
+func (w *Worker) fetchAndSave(ctx context.Context, api *model.APIInfo, contentColl *mongo.Collection, now time.Time, attempt int) bool {
 	var req *http.Request
 	var err error
 
@@ -111,13 +170,25 @@ func (w *Worker) fetchAndSave(ctx context.Context, api *model.APIInfo, contentCo
 	} else if strings.ToUpper(api.Method) == "POST/JSON" {
 		jsonData, err := json.Marshal(api.Params)
 		if err != nil {
-			return // 或者 log 错误
+			w.Log.Error("Failed to marshal JSON params",
+				zap.String("source", api.Source),
+				zap.String("category", api.Category),
+				zap.Int("attempt", attempt),
+				zap.Error(err),
+			)
+			return false // 序列化失败，不重试
 		}
 
 		// 创建 POST 请求，body 是 JSON
 		req, err = http.NewRequestWithContext(ctx, api.Method, api.URL, bytes.NewReader(jsonData))
 		if err != nil {
-			return
+			w.Log.Error("Failed to create POST/JSON request",
+				zap.String("source", api.Source),
+				zap.String("category", api.Category),
+				zap.Int("attempt", attempt),
+				zap.Error(err),
+			)
+			return false
 		}
 		req.Header.Set("Content-Type", "application/json")
 	} else if strings.ToUpper(api.Method) == "POST/FORM" {
@@ -126,7 +197,26 @@ func (w *Worker) fetchAndSave(ctx context.Context, api *model.APIInfo, contentCo
 			form.Set(k, v)
 		}
 		req, err = http.NewRequestWithContext(ctx, api.Method, api.URL, strings.NewReader(form.Encode()))
+		if err != nil {
+			w.Log.Error("Failed to create POST/FORM request",
+				zap.String("source", api.Source),
+				zap.String("category", api.Category),
+				zap.Int("attempt", attempt),
+				zap.Error(err),
+			)
+			return false
+		}
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
+
+	if req == nil {
+		w.Log.Error("Failed to create request - unsupported method",
+			zap.String("method", api.Method),
+			zap.String("source", api.Source),
+			zap.String("category", api.Category),
+			zap.Int("attempt", attempt),
+		)
+		return false
 	}
 
 	for k, v := range api.Headers {
@@ -135,38 +225,73 @@ func (w *Worker) fetchAndSave(ctx context.Context, api *model.APIInfo, contentCo
 
 	resp, err := w.HTTPClient.Do(req)
 	if err != nil {
-		w.Log.Error("Failed to fetch API", zap.String("url", api.URL), zap.Error(err))
-		return
+		w.Log.Error("Failed to fetch API",
+			zap.String("url", api.URL),
+			zap.String("source", api.Source),
+			zap.String("category", api.Category),
+			zap.Int("attempt", attempt),
+			zap.Error(err),
+		)
+		return false // 网络错误，触发重试
 	}
 	defer func(Body io.ReadCloser) {
 		err := Body.Close()
 		if err != nil {
-
+			w.Log.Warn("Failed to close response body", zap.Error(err))
 		}
 	}(resp.Body)
-	body, _ := io.ReadAll(resp.Body)
 
-	w.Log.Info("Fetched API", zap.String("body: ", string(body)))
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		w.Log.Error("Failed to read response body",
+			zap.String("source", api.Source),
+			zap.String("category", api.Category),
+			zap.Int("attempt", attempt),
+			zap.Error(err),
+		)
+		return false
+	}
+
+	w.Log.Info("Fetched API",
+		zap.String("source", api.Source),
+		zap.String("category", api.Category),
+		zap.Int("attempt", attempt),
+		zap.String("body", string(body)),
+	)
 
 	var parsed any
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		w.Log.Warn("Invalid JSON, skip", zap.Error(err))
-		return
+		w.Log.Warn("Invalid JSON, skip",
+			zap.String("source", api.Source),
+			zap.String("category", api.Category),
+			zap.Int("attempt", attempt),
+			zap.Error(err),
+		)
+		return false // JSON解析失败，不重试
 	}
 
 	// 顶层必须是对象
 	parsedObj, ok := parsed.(map[string]any)
 	if !ok {
-		w.Log.Warn("Top-level is not JSON object, skip")
-		return
+		w.Log.Warn("Top-level is not JSON object, skip",
+			zap.String("source", api.Source),
+			zap.String("category", api.Category),
+			zap.Int("attempt", attempt),
+		)
+		return false // 格式错误，不重试
 	}
 
 	// Required 校验（全转 string 比较）
 	for key, want := range api.Required {
 		gotVal, exists := parsedObj[key]
 		if !exists {
-			w.Log.Warn("skip: missing required field", zap.String("field", key))
-			return
+			w.Log.Warn("skip: missing required field",
+				zap.String("field", key),
+				zap.String("source", api.Source),
+				zap.String("category", api.Category),
+				zap.Int("attempt", attempt),
+			)
+			return false // 字段缺失，触发重试
 		}
 		// 转成 string
 		wantStr := fmt.Sprint(want)
@@ -176,8 +301,11 @@ func (w *Worker) fetchAndSave(ctx context.Context, api *model.APIInfo, contentCo
 				zap.String("field", key),
 				zap.String("want", wantStr),
 				zap.String("got", gotStr),
+				zap.String("source", api.Source),
+				zap.String("category", api.Category),
+				zap.Int("attempt", attempt),
 			)
-			return
+			return false // 字段值不匹配，触发重试
 		}
 	}
 
@@ -196,5 +324,23 @@ func (w *Worker) fetchAndSave(ctx context.Context, api *model.APIInfo, contentCo
 		Processed: false, // 新增的默认值
 		CreatedAt: time.Now().UTC(),
 	}
-	_, _ = contentColl.InsertOne(ctx, doc)
+
+	_, err = contentColl.InsertOne(ctx, doc)
+	if err != nil {
+		w.Log.Error("Failed to insert document",
+			zap.String("source", api.Source),
+			zap.String("category", api.Category),
+			zap.Int("attempt", attempt),
+			zap.Error(err),
+		)
+		return false // 数据库插入失败，可以重试
+	}
+
+	w.Log.Info("Successfully processed API",
+		zap.String("source", api.Source),
+		zap.String("category", api.Category),
+		zap.Int("attempt", attempt),
+	)
+
+	return true // 成功
 }

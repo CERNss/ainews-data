@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -22,6 +23,7 @@ type Worker struct {
 	Log        *zap.Logger
 	Stores     *helper.Stores
 	HTTPClient *http.Client
+	retryWg    sync.WaitGroup // 用于等待所有重试goroutine完成
 }
 
 func next4x(now time.Time, loc *time.Location) time.Time {
@@ -47,6 +49,9 @@ func (w *Worker) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			// 等待所有重试goroutine完成
+			w.Log.Info("Waiting for retry goroutines to complete...")
+			w.retryWg.Wait()
 			return
 		default:
 			next := next4x(time.Now(), shanghai)
@@ -58,6 +63,9 @@ func (w *Worker) Run(ctx context.Context) {
 			select {
 			case <-ctx.Done():
 				timer.Stop()
+				// 等待所有重试goroutine完成
+				w.Log.Info("Waiting for retry goroutines to complete...")
+				w.retryWg.Wait()
 				return
 			case <-timer.C:
 				w.runOnce(ctx)
@@ -92,7 +100,8 @@ func (w *Worker) runOnce(ctx context.Context) {
 			w.Log.Error("Failed to decode API", zap.Error(err))
 			continue
 		}
-		w.fetchAndSaveWithRetry(ctx, &api, contentColl, now)
+		// 非阻塞的重试机制
+		w.fetchAndSaveWithAsyncRetry(ctx, &api, contentColl, now)
 	}
 }
 
@@ -109,50 +118,70 @@ func (w *Worker) calculateRetryDelay(retryCount int) time.Duration {
 	return delay
 }
 
-// fetchAndSaveWithRetry 带重试机制的抓取和保存
-func (w *Worker) fetchAndSaveWithRetry(ctx context.Context, api *model.APIInfo, contentColl *mongo.Collection, now time.Time) {
+// fetchAndSaveWithAsyncRetry 非阻塞的重试机制
+func (w *Worker) fetchAndSaveWithAsyncRetry(ctx context.Context, api *model.APIInfo, contentColl *mongo.Collection, now time.Time) {
+	// 第一次尝试同步执行
+	success := w.fetchAndSave(ctx, api, contentColl, now, 1)
+	if success {
+		// 第一次就成功，直接返回
+		return
+	}
+
+	// 第一次失败，启动异步重试goroutine
+	w.retryWg.Add(1)
+	go func() {
+		defer w.retryWg.Done()
+		w.asyncRetryLoop(ctx, api, contentColl, now)
+	}()
+}
+
+// asyncRetryLoop 异步重试循环
+func (w *Worker) asyncRetryLoop(ctx context.Context, api *model.APIInfo, contentColl *mongo.Collection, now time.Time) {
 	const maxRetries = 5
 
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		success := w.fetchAndSave(ctx, api, contentColl, now, attempt)
-		if success {
-			// 成功，退出重试循环
-			return
-		}
+	for attempt := 2; attempt <= maxRetries; attempt++ {
+		// 计算重试延迟：15s * 2^(n-1)
+		retryDelay := w.calculateRetryDelay(attempt - 1) // attempt-1 因为这是第2次开始
 
-		if attempt < maxRetries {
-			// 计算重试延迟：15s * 2^(n-1)
-			retryDelay := w.calculateRetryDelay(attempt)
-			w.Log.Info("Retrying after delay",
+		w.Log.Info("Async retry scheduled",
+			zap.String("source", api.Source),
+			zap.String("category", api.Category),
+			zap.Int("attempt", attempt),
+			zap.Int("maxRetries", maxRetries),
+			zap.Duration("delay", retryDelay),
+		)
+
+		// 等待重试延迟
+		timer := time.NewTimer(retryDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			w.Log.Info("Context cancelled, stopping async retries",
 				zap.String("source", api.Source),
 				zap.String("category", api.Category),
 				zap.Int("attempt", attempt),
-				zap.Int("maxRetries", maxRetries),
-				zap.Duration("delay", retryDelay),
 			)
-
-			// 等待重试延迟
-			timer := time.NewTimer(retryDelay)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				w.Log.Info("Context cancelled, stopping retries",
+			return
+		case <-timer.C:
+			// 执行重试
+			success := w.fetchAndSave(ctx, api, contentColl, now, attempt)
+			if success {
+				w.Log.Info("Async retry succeeded",
 					zap.String("source", api.Source),
 					zap.String("category", api.Category),
+					zap.Int("attempt", attempt),
 				)
-				return
-			case <-timer.C:
-				// 继续重试
+				return // 成功，退出重试循环
 			}
-		} else {
-			// 达到最大重试次数
-			w.Log.Error("Max retries exceeded, giving up",
-				zap.String("source", api.Source),
-				zap.String("category", api.Category),
-				zap.Int("maxRetries", maxRetries),
-			)
 		}
 	}
+
+	// 达到最大重试次数
+	w.Log.Error("Async retry max attempts exceeded, giving up",
+		zap.String("source", api.Source),
+		zap.String("category", api.Category),
+		zap.Int("maxRetries", maxRetries),
+	)
 }
 
 func (w *Worker) fetchAndSave(ctx context.Context, api *model.APIInfo, contentColl *mongo.Collection, now time.Time, attempt int) bool {
@@ -309,8 +338,43 @@ func (w *Worker) fetchAndSave(ctx context.Context, api *model.APIInfo, contentCo
 		}
 	}
 
-	// 拆 data，只保留顶层对象
-	data := bson.M(parsedObj)
+	// 根据配置决定数据提取策略
+	var data bson.M
+	var extractionStrategy string
+
+	// 检查是否配置了自定义数据字段
+	if api.DataField != "" {
+		// 使用自定义字段名
+		if dataVal, exists := parsedObj[api.DataField]; exists {
+			data = w.convertToDataBson(dataVal)
+			extractionStrategy = fmt.Sprintf("custom field: %s", api.DataField)
+		} else {
+			w.Log.Warn("skip: missing custom data field in response",
+				zap.String("dataField", api.DataField),
+				zap.String("source", api.Source),
+				zap.String("category", api.Category),
+				zap.Int("attempt", attempt),
+			)
+			return false // 自定义data字段缺失，触发重试
+		}
+	} else if api.UseFullResponse {
+		// 使用完整响应
+		data = bson.M(parsedObj)
+		extractionStrategy = "full response"
+	} else {
+		// 默认使用 "data" 字段
+		if dataVal, exists := parsedObj["data"]; exists {
+			data = w.convertToDataBson(dataVal)
+			extractionStrategy = "default data field"
+		} else {
+			w.Log.Warn("skip: missing 'data' field in response",
+				zap.String("source", api.Source),
+				zap.String("category", api.Category),
+				zap.Int("attempt", attempt),
+			)
+			return false // data字段缺失，触发重试
+		}
+	}
 
 	// 使用 Asia/Shanghai 生成 date 字段（YYYY-MM-DD）
 	shanghai, _ := time.LoadLocation("Asia/Shanghai")
@@ -321,7 +385,7 @@ func (w *Worker) fetchAndSave(ctx context.Context, api *model.APIInfo, contentCo
 		Category:  api.Category,
 		InfoType:  api.InfoType,
 		Data:      data,
-		Processed: false, // 新增的默认值
+		Processed: false,
 		CreatedAt: time.Now().UTC(),
 	}
 
@@ -340,7 +404,20 @@ func (w *Worker) fetchAndSave(ctx context.Context, api *model.APIInfo, contentCo
 		zap.String("source", api.Source),
 		zap.String("category", api.Category),
 		zap.Int("attempt", attempt),
+		zap.String("extractionStrategy", extractionStrategy),
 	)
 
 	return true // 成功
+}
+
+// convertToDataBson 将不同类型的数据转换为 bson.M
+func (w *Worker) convertToDataBson(dataVal any) bson.M {
+	switch v := dataVal.(type) {
+	case map[string]any:
+		return bson.M(v) // data是对象，直接使用
+	case []any:
+		return bson.M{"items": v} // data是数组，包装为 {"items": [...]}
+	default:
+		return bson.M{"value": v} // data是基本类型，包装为 {"value": ...}
+	}
 }

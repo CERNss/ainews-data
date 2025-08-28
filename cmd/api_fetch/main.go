@@ -1,16 +1,16 @@
 package main
 
 import (
+	"api-fetch/internal/api_fetch/api"
+	"api-fetch/internal/api_fetch/helper"
+	"api-fetch/internal/api_fetch/processor"
+	"api-fetch/internal/api_fetch/scheduler"
 	"api-fetch/internal/middleware/logger"
+	"api-fetch/pkg/mongodb"
 	"context"
 	"go.uber.org/zap"
 	"net/http"
 	"time"
-
-	"api-fetch/internal/api_fetch/api"
-	"api-fetch/internal/api_fetch/helper"
-	"api-fetch/internal/api_fetch/scheduler"
-	"api-fetch/pkg/mongodb"
 )
 
 func main() {
@@ -49,12 +49,22 @@ func main() {
 	)
 
 	// 2) 启动最小定时任务（写死：每 1 分钟跑一次）
-	worker := &scheduler.Worker{
-		Log:        log,
-		Stores:     stores,
-		HTTPClient: &http.Client{Timeout: 10 * time.Second},
-	}
-	go worker.Run(context.Background())
+	worker := scheduler.NewScheduler(
+		log,
+		stores,
+		&http.Client{Timeout: 10 * time.Second},
+	)
+	worker.Run(ctx)
+
+	dp := processor.NewDataProcessor(log, stores)
+	dp.Run(ctx, []processor.DataProcessorConfig{
+		{
+			Source:   "澎湃",
+			Category: "general",
+			InfoType: "daily",
+			Enabled:  true,
+		},
+	})
 
 	// 3) 起 HTTP API
 	srv := &api.Server{Stores: stores}

@@ -200,6 +200,7 @@ func transformItem(item interface{}, seriesType string, logger *zap.Logger) (map
 
 	result["seriesType"] = seriesType
 	result["origin_url"] = fmt.Sprintf("https://www.thepaper.cn/detail/%s", articleID)
+	result["processed"] = true
 
 	return result, true
 }

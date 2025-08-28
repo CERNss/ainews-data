@@ -57,6 +57,15 @@ func next4xPlus15(now time.Time, loc *time.Location) time.Time {
 	return next4x(now, loc).Add(15 * time.Minute)
 }
 
+func every5minutes(now time.Time) time.Time {
+	rounded := now.Truncate(5 * time.Minute) // 将当前时间向下取整到最近的 5 分钟
+	if rounded.Before(now) {
+		// 如果当前时间已经超过了这个 5 分钟整点，计算下一个 5 分钟整点
+		rounded = rounded.Add(5 * time.Minute)
+	}
+	return rounded
+}
+
 // Run 启动调度器主循环
 func (s *Scheduler) Run(ctx context.Context) {
 	s.Log.Info("Scheduler starting...")

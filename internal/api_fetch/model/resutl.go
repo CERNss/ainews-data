@@ -25,5 +25,6 @@ type ProcessedData struct {
 	Date        string                 `bson:"date"`
 	ProcessedAt time.Time              `bson:"processed_at"`
 	Data        map[string]interface{} `bson:"data"`
+	Processed   bool                   `bson:"processed" json:"processed"`
 	RawDocID    string                 `bson:"raw_doc_id"` // 原始文档ID
 }

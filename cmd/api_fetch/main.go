@@ -3,7 +3,6 @@ package main
 import (
 	"api-fetch/internal/api_fetch/api"
 	"api-fetch/internal/api_fetch/helper"
-	"api-fetch/internal/api_fetch/processor"
 	"api-fetch/internal/api_fetch/scheduler"
 	"api-fetch/internal/middleware/logger"
 	"api-fetch/pkg/mongodb"
@@ -48,7 +47,6 @@ func main() {
 		cfg.Mongo.AuthSource,
 	)
 
-	// 2) 启动最小定时任务（写死：每 1 分钟跑一次）
 	worker := scheduler.NewScheduler(
 		log,
 		stores,
@@ -56,17 +54,16 @@ func main() {
 	)
 	worker.Run(ctx)
 
-	dp := processor.NewDataProcessor(log, stores)
-	dp.Run(ctx, []processor.DataProcessorConfig{
-		{
-			Source:   "澎湃",
-			Category: "general",
-			InfoType: "daily",
-			Enabled:  true,
-		},
-	})
+	//dp := processor.NewDataProcessor(log, stores)
+	//dp.Run(ctx, []processor.DataProcessorConfig{
+	//	{
+	//		Source:   "澎湃",
+	//		Category: "general",
+	//		InfoType: "daily",
+	//		Enabled:  true,
+	//	},
+	//})
 
-	// 3) 起 HTTP API
 	srv := &api.Server{Stores: stores}
 	r := srv.Router()
 	_ = r.SetTrustedProxies(nil)

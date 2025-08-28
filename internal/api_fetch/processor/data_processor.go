@@ -86,7 +86,7 @@ func (dp *DataProcessor) processData(ctx context.Context, config DataProcessorCo
 		"source":    config.Source,
 		"category":  config.Category,
 		"info_type": config.InfoType,
-		"processed": true,
+		"processed": false,
 	}
 
 	// 获取今天的集合名
